@@ -26,3 +26,5 @@ pip-log.txt
 
 #Translations
 *.mo
+
+.pybuild/
