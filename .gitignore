@@ -27,3 +27,7 @@ pip-log.txt
 
 #Translations
 *.mo
+
+.cargo/
+vendor/
+.pybuild/
