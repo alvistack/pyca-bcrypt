@@ -1,0 +1,4 @@
+python3-bcrypt: copyright-without-copyright-notice
+python3-bcrypt: initial-upload-closes-no-bugs
+python3-bcrypt: no-manual-page
+python3-bcrypt: zero-byte-file-in-doc-directory
