@@ -1,0 +1,5 @@
+python-bcrypt source: file-without-copyright-information
+python-bcrypt source: no-debian-changes
+python-bcrypt source: source-contains-prebuilt-windows-binary
+python-bcrypt source: source-package-encodes-python-version
+python-bcrypt source: unpack-message-for-orig

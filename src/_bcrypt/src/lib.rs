@@ -13,10 +13,8 @@
 #![deny(rust_2018_idioms)]
 
 use base64::Engine;
-use pyo3::types::PyBytesMethods;
 use pyo3::PyTypeInfo;
 use std::convert::TryInto;
-use std::ffi::CString;
 use std::io::Write;
 use subtle::ConstantTimeEq;
 
@@ -25,13 +23,13 @@ pub const BASE64_ENGINE: base64::engine::GeneralPurpose = base64::engine::Genera
     base64::engine::general_purpose::NO_PAD,
 );
 
-#[pyo3::pyfunction]
-#[pyo3(signature = (rounds=12, prefix=None), text_signature = "(rounds=12, prefix=b'2b')")]
+#[pyo3::prelude::pyfunction]
 fn gensalt<'p>(
     py: pyo3::Python<'p>,
-    rounds: u16,
+    rounds: Option<u16>,
     prefix: Option<&[u8]>,
-) -> pyo3::PyResult<pyo3::Bound<'p, pyo3::types::PyBytes>> {
+) -> pyo3::PyResult<&'p pyo3::types::PyBytes> {
+    let rounds = rounds.unwrap_or(12);
     let prefix = prefix.unwrap_or(b"2b");
 
     if prefix != b"2a" && prefix != b"2b" {
@@ -65,28 +63,19 @@ fn gensalt<'p>(
     )
 }
 
-#[pyo3::pyfunction]
+#[pyo3::prelude::pyfunction]
 fn hashpw<'p>(
     py: pyo3::Python<'p>,
     password: &[u8],
     salt: &[u8],
-) -> pyo3::PyResult<pyo3::Bound<'p, pyo3::types::PyBytes>> {
+) -> pyo3::PyResult<&'p pyo3::types::PyBytes> {
     // bcrypt originally suffered from a wraparound bug:
     // http://www.openwall.com/lists/oss-security/2012/01/02/4
     // This bug was corrected in the OpenBSD source by truncating inputs to 72
     // bytes on the updated prefix $2b$, but leaving $2a$ unchanged for
     // compatibility. However, pyca/bcrypt 2.0.0 *did* correctly truncate inputs
     // on $2a$, so we do it here to preserve compatibility with 2.0.0
-    // Silent truncation is _probably_ not the best idea, even if the "original"
-    // OpenBSD implementation did/does this.
-    // We prefer to raise a ValueError in this case - if the user _wants_ to truncate,
-    // they can always do so manually by passing s[:72] instead of s into hashpw().
-
-    if password.len() > 72 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "password cannot be longer than 72 bytes, truncate manually if necessary (e.g. my_password[:72])",
-        ));
-    }
+    let password = &password[..password.len().min(72)];
 
     // salt here is not just the salt bytes, but rather an encoded value
     // containing a version number, number of rounds, and the salt.
@@ -126,7 +115,7 @@ fn hashpw<'p>(
         .map_err(|_| pyo3::exceptions::PyValueError::new_err("Invalid salt"))?;
 
     let hashed = py
-        .detach(|| bcrypt::hash_with_salt(password, cost, raw_salt))
+        .allow_threads(|| bcrypt::hash_with_salt(password, cost, raw_salt))
         .map_err(|_| pyo3::exceptions::PyValueError::new_err("Invalid salt"))?;
     Ok(pyo3::types::PyBytes::new(
         py,
@@ -134,7 +123,7 @@ fn hashpw<'p>(
     ))
 }
 
-#[pyo3::pyfunction]
+#[pyo3::prelude::pyfunction]
 fn checkpw(py: pyo3::Python<'_>, password: &[u8], hashed_password: &[u8]) -> pyo3::PyResult<bool> {
     Ok(hashpw(py, password, hashed_password)?
         .as_bytes()
@@ -142,16 +131,17 @@ fn checkpw(py: pyo3::Python<'_>, password: &[u8], hashed_password: &[u8]) -> pyo
         .into())
 }
 
-#[pyo3::pyfunction]
-#[pyo3(signature = (password, salt, desired_key_bytes, rounds, ignore_few_rounds=false))]
+#[pyo3::prelude::pyfunction]
 fn kdf<'p>(
     py: pyo3::Python<'p>,
     password: &[u8],
     salt: &[u8],
     desired_key_bytes: usize,
     rounds: u32,
-    ignore_few_rounds: bool,
-) -> pyo3::PyResult<pyo3::Bound<'p, pyo3::types::PyBytes>> {
+    ignore_few_rounds: Option<bool>,
+) -> pyo3::PyResult<&'p pyo3::types::PyBytes> {
+    let ignore_few_rounds = ignore_few_rounds.unwrap_or(false);
+
     if password.is_empty() || salt.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "password and salt must not be empty",
@@ -170,55 +160,39 @@ fn kdf<'p>(
         ));
     }
 
-    if rounds < 50 && !ignore_few_rounds {
-        // They probably think bcrypt.kdf()'s rounds parameter is logarithmic,
-        // expecting this value to be slow enough (it probably would be if this
-        // were bcrypt). Emit a warning.
-        pyo3::PyErr::warn(
-            py,
-            &pyo3::exceptions::PyUserWarning::type_object(py),
-            &CString::new(format!("Warning: bcrypt.kdf() called with only {rounds} round(s). This few is not secure: the parameter is linear, like PBKDF2.")).unwrap(),
-            3
-        )?;
-    }
-
     pyo3::types::PyBytes::new_with(py, desired_key_bytes, |output| {
-        py.detach(|| {
+        py.allow_threads(|| {
             bcrypt_pbkdf::bcrypt_pbkdf(password, salt, rounds, output).unwrap();
         });
         Ok(())
     })
 }
 
-#[pyo3::pymodule(gil_used = false)]
-mod _bcrypt {
-    use pyo3::types::PyModuleMethods;
+#[pyo3::prelude::pymodule]
+fn _bcrypt(_py: pyo3::Python<'_>, m: &pyo3::types::PyModule) -> pyo3::PyResult<()> {
+    m.add_function(pyo3::wrap_pyfunction!(gensalt, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(hashpw, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(checkpw, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(kdf, m)?)?;
 
-    #[pymodule_export]
-    use super::{checkpw, gensalt, hashpw, kdf};
+    m.add("__title__", "bcrypt")?;
+    m.add(
+        "__summary__",
+        "Modern(-ish) password hashing for your software and your servers",
+    )?;
+    m.add("__uri__", "https://github.com/pyca/bcrypt/")?;
 
-    // Not yet possible to add constants declaratively.
-    #[pymodule_init]
-    fn init(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
-        m.add("__title__", "bcrypt")?;
-        m.add(
-            "__summary__",
-            "Modern(-ish) password hashing for your software and your servers",
-        )?;
-        m.add("__uri__", "https://github.com/pyca/bcrypt/")?;
+    // When updating this, also update pyproject.toml
+    // This isn't named __version__ because passlib treats the existence of
+    // that attribute as proof that we're a different module
+    m.add("__version_ex__", "5.0.0")?;
 
-        // When updating this, also update pyproject.toml
-        // This isn't named __version__ because passlib treats the existence of
-        // that attribute as proof that we're a different module
-        m.add("__version_ex__", "5.0.0")?;
+    let author = "The Python Cryptographic Authority developers";
+    m.add("__author__", author)?;
+    m.add("__email__", "cryptography-dev@python.org")?;
 
-        let author = "The Python Cryptographic Authority developers";
-        m.add("__author__", author)?;
-        m.add("__email__", "cryptography-dev@python.org")?;
+    m.add("__license__", "Apache License, Version 2.0")?;
+    m.add("__copyright__", format!("Copyright 2013-2024 {author}"))?;
 
-        m.add("__license__", "Apache License, Version 2.0")?;
-        m.add("__copyright__", format!("Copyright 2013-2025 {author}"))?;
-
-        Ok(())
-    }
+    Ok(())
 }
